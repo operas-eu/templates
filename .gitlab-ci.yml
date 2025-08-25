@@ -1,0 +1,258 @@
+##################
+## GLOBAL SETTINGS
+##################
+
+variables:
+  # Project Configuration
+  BRANCH_SOURCE: "main"
+  BRANCH_PAGES: "gl-pages"
+  GIT_DEPTH: 1
+
+  # Version Management
+  UV_PYTHON: "3.13"
+  VERSION_ALPINE: "3.22"
+
+  # Variables which should be defined as CI/CD variables
+  #PUSH_TOKEN: ## DO NOT DEFINE HERE FOR SECURITY REASONS; only define a PUSH_TOKEN if your $CI_JOB_TOKEN is not allowed to push
+
+
+##################
+## PIPELINE STAGES
+##################
+
+stages:
+  - synchronize_metadata
+  - build_docs
+  - deploy_docs
+
+
+##################
+## PIPELINE JOBS
+##################
+
+.rule_is_main_branch: &is_main_branch
+  if: '$CI_COMMIT_BRANCH == $BRANCH_SOURCE'
+
+# Stage: Synchronize Metadata
+synchronize_metadata:
+  stage: synchronize_metadata
+  rules: [*is_main_branch]
+  extends: .job_synchronize_metadata
+
+# Stage: Build Documentation
+build_docs_latest:
+  stage: build_docs
+  rules: [*is_main_branch]
+  variables: {DEPLOYMENT_VERSION_NAME: "latest"}
+  extends: .job_build_docs
+
+# Stage: Deploy Documentation and Upload to Zenodo
+pages:
+  stage: deploy_docs
+  rules: [*is_main_branch]
+  extends: .job_pages
+
+
+##################
+## BASH SNIPPETS
+##################
+
+# Common package installation scripts
+.apk_add_git_and_config: &apk_add_git_and_config
+  - apk add git
+  - git config --global user.email "gitlab-ci[bot]@noreply.gitlab.com"
+  - git config --global user.name "GitLab CI[bot]"
+
+.apk_add_yq: &apk_add_yq
+  - apk add wget
+  - wget --quiet "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64" --output-document=/usr/local/bin/yq && chmod +x /usr/local/bin/yq
+
+# Git operation scripts
+.git_commit_all_changes: &git_commit_all_changes
+  # Debug information
+  - git diff
+  - git status
+  # Pull latest version of branch
+  - git fetch --depth=1 origin "$COMMIT_BRANCH"
+  - git stash
+  - git switch "$COMMIT_BRANCH"
+  - git pull --depth=1 origin "$COMMIT_BRANCH"
+  - git stash pop || echo "No stash to apply."
+  # Check for changes and commit if needed
+  - |
+    if [ -n "$(git status --porcelain)" ]; then
+      echo "Files have changed. Create commit."
+      git add .
+      git commit --message="$COMMIT_MESSAGE"
+    else
+      echo "No changes to commit."
+    fi
+
+.git_reset_hard_branch: &git_reset_hard_branch
+  # Debug information
+  - git diff
+  - git status
+  # Checkout build branch
+  - git fetch --depth=1 origin "$SWITCH_BRANCH"
+  - git switch --discard-changes "$SWITCH_BRANCH"
+  - git pull --depth=1 origin "$SWITCH_BRANCH"
+  - echo "Successfully checked out $SWITCH_BRANCH"
+
+.git_push: &git_push
+  - |
+    # Test if PUSH_TOKEN is defined as CI/CD variable; otherwise default to $CI_JOB_TOKEN.
+    if [ -z "$PUSH_TOKEN" ]; then
+      echo "No PUSH_TOKEN as CI/CD variable defined. Using CI_JOB_TOKEN."
+      PUSH_TOKEN="$CI_JOB_TOKEN"
+    fi
+  - git push --push-option=ci.skip https://gitlab-ci-token:$PUSH_TOKEN@$CI_SERVER_HOST/$CI_PROJECT_PATH.git "$PUSH_REFSPEC"
+
+
+##################
+## JOB TEMPLATES
+##################
+
+default:
+  image: alpine:$VERSION_ALPINE
+
+####################################################################################################
+
+
+.job_synchronize_metadata:
+
+  before_script:
+    - apk add coreutils  # For avoiding "realpath: --: No such file or directory"
+    - *apk_add_git_and_config
+    - apk add jq
+    - apk add uv
+    - *apk_add_yq
+    - SWITCH_BRANCH="$BRANCH_SOURCE"
+    - *git_reset_hard_branch
+
+  script:
+    # Validate metadata in CITATION.cff
+    - uvx cffconvert --validate
+
+    ## Create .zenodo.json
+
+    # Convert CITATION.cff to Zenodo metadata format
+    - uvx cffconvert --infile CITATION.cff --format zenodo --outfile .zenodo.json
+    # Add Zenodo upload type
+    - jq '.upload_type = "lesson"' .zenodo.json > .zenodo.json.tmp && mv .zenodo.json.tmp .zenodo.json
+    # Fix Zenodo license field in the .zenodo.json metadata, as per new Zenodo requirements
+    - jq '.license = .license.id' .zenodo.json > .zenodo.json.tmp && mv .zenodo.json.tmp .zenodo.json
+    # Enrich Zenodo metadata (if template file exists)
+    - |
+      if [ -f ".github/templates/zenodo_metadata_enrichment.json" ]; then
+        echo "Adding zenodo_metadata_enrichment.json to .zenodo.json..."
+        jq --slurp '.[0] * .[1]' .zenodo.json .github/templates/zenodo_metadata_enrichment.json > .zenodo.json.tmp && mv .zenodo.json.tmp .zenodo.json
+      else
+        echo "Warning: File zenodo_metadata_enrichment.json not found."
+      fi
+
+    ## Update mkdocs.yml
+
+    # Update mkdocs.yml with new CITATION.cff values
+    - "yq eval-all --inplace 'select(fileIndex == 0) * {\"citation\": select(fileIndex == 1)}' mkdocs.yml CITATION.cff"
+    # Extract only year in mkdocs metadata
+    - yq eval-all --inplace '.citation.date-released=(.citation.date-released | split("-"))[0]' mkdocs.yml
+
+    # Construct linkset URL
+    - LINKSET_URL="${CI_PROJECT_URL}/-/raw/${CI_COMMIT_REF_NAME}/linkset.json"
+    - echo "LINKSET_URL=$LINKSET_URL"
+    # Update linkset path in mkdocs.yml
+    - yq eval --inplace ".signposting_linkset=\"${LINKSET_URL}\"" mkdocs.yml
+
+    ## Signposting
+
+    # Read signposting URL from mkdocs.yml
+    - GL_PAGES_URL=$(yq eval '.signposting_gitbook_url' mkdocs.yml)
+    - |
+      # Use URL from CI-Pipeline for pages if nothing is specified in mkdocs.yml
+      if [ -z "$GL_PAGES_URL" -o "$GL_PAGES_URL" == "null" ]; then
+        echo "No signposting_gitbook_url in mkdocs found. Setting site url to $CI_PAGES_URL/$GL_PAGES_VERSION/"
+        GL_PAGES_URL="${CI_PAGES_URL}/latest/"
+      fi
+    - echo "GL_PAGES_URL=$GL_PAGES_URL"
+
+    # Read signposting profile from mkdocs.yml
+    - SIGNPOSTING_PROFILE=$(yq eval '.signposting_default_profile' mkdocs.yml)
+    - |
+      if [ "$SIGNPOSTING_PROFILE" == "null" ]; then
+        SIGNPOSTING_PROFILE=""
+      fi
+    - echo "SIGNPOSTING_PROFILE=$SIGNPOSTING_PROFILE"
+
+    # Extract signposting metadata (modified GH action korvoj/signposting)
+    - |
+      # uv run python .gitlab/scripts/signposting.py
+      uv run \
+        --with requests,pyyaml,wcmatch \
+        python .gitlab/scripts/signposting.py \
+        --default-profile "${SIGNPOSTING_PROFILE}" \
+        --pages-url ${GL_PAGES_URL} \
+        --gl-repository-url ${CI_PROJECT_URL} \
+        --default-branch ${BRANCH_SOURCE}
+
+    # Commit changes
+    - COMMIT_MESSAGE="[CI] Update metadata"
+    - COMMIT_BRANCH="${BRANCH_SOURCE}"
+    - *git_commit_all_changes
+    # Push changes
+    - PUSH_REFSPEC="$COMMIT_BRANCH"
+    - *git_push
+
+####################################################################################################
+
+
+.job_build_docs:
+
+  before_script:
+    - apk add coreutils  # For avoiding "realpath: --: No such file or directory"
+    - *apk_add_git_and_config
+    - apk add uv
+    - SWITCH_BRANCH="$BRANCH_SOURCE"
+    - *git_reset_hard_branch
+
+  script:
+    # Update local copy of branch for pages deployment
+    - git fetch --depth=1 origin "$BRANCH_PAGES" || echo "Nothing to fetch for remote branch $BRANCH_PAGES"
+
+    # Deploy documentation version
+    - |
+      # uv run mike deploy
+      uv run \
+        --with-requirements requirements.txt \
+        mike deploy \
+        --push \
+        --update-aliases \
+        --branch $BRANCH_PAGES \
+        --deploy-prefix public \
+        $DEPLOYMENT_VERSION_NAME
+
+    # Set default version
+    - |
+      # uv run mike set-default
+      uv run \
+        --with-requirements requirements.txt \
+        mike set-default \
+        --push \
+        --branch $BRANCH_PAGES \
+        --deploy-prefix public \
+        latest
+
+####################################################################################################
+
+.job_pages:
+
+  before_script:
+    - *apk_add_git_and_config
+    - SWITCH_BRANCH="$BRANCH_PAGES"
+    - *git_reset_hard_branch
+  script:
+    # Debug information
+    - ls -lh public
+    # No need to do anything further, GitLab Pages picks up the content of the 'public/' folder and deploys them to GitLab Pages
+  artifacts:
+    paths:
+      - public/
