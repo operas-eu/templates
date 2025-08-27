@@ -14,6 +14,9 @@ variables:
 
   # Variables which should be defined as CI/CD variables
   #PUSH_TOKEN: ## DO NOT DEFINE HERE FOR SECURITY REASONS; only define a PUSH_TOKEN if your $CI_JOB_TOKEN is not allowed to push
+  #ZENODO_USE_SANDBOX: "true"
+  #ZENODO_ACCESS_TOKEN:  ## DO NOT DEFINE HERE FOR SECURITY REASONS
+  #ZENODO_SANDBOX_ACCESS_TOKEN:  ## DO NOT DEFINE HERE FOR SECURITY REASONS
 
 
 ##################
@@ -21,6 +24,7 @@ variables:
 ##################
 
 stages:
+  - prepare_release
   - synchronize_metadata
   - build_docs
   - deploy_docs
@@ -33,24 +37,45 @@ stages:
 .rule_is_main_branch: &is_main_branch
   if: '$CI_COMMIT_BRANCH == $BRANCH_SOURCE'
 
-# Stage: Synchronize Metadata
+.rule_is_release_tag: &is_release_tag
+  if: '$CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+(\.[0-9]+)?$/'
+
+# Stage 1: Reserve DOI
+prepare_release:
+  stage: prepare_release
+  rules: [*is_release_tag]
+  extends: .job_prepare_release
+
+# Stage 2: Synchronize Metadata
 synchronize_metadata:
   stage: synchronize_metadata
-  rules: [*is_main_branch]
+  rules: [*is_release_tag, *is_main_branch]
   extends: .job_synchronize_metadata
 
-# Stage: Build Documentation
+# Stage 3: Build Documentation
 build_docs_latest:
   stage: build_docs
-  rules: [*is_main_branch]
+  rules: [*is_release_tag, *is_main_branch]
   variables: {DEPLOYMENT_VERSION_NAME: "latest"}
   extends: .job_build_docs
 
-# Stage: Deploy Documentation and Upload to Zenodo
+build_docs_release:
+  stage: build_docs
+  rules: [*is_release_tag]
+  needs: ["build_docs_latest"]
+  variables: {DEPLOYMENT_VERSION_NAME: "$CI_COMMIT_TAG"}
+  extends: .job_build_docs
+
+# Stage 4: Deploy Documentation and Upload to Zenodo
 pages:
   stage: deploy_docs
-  rules: [*is_main_branch]
+  rules: [*is_release_tag, *is_main_branch]
   extends: .job_pages
+
+upload_zenodo:
+  stage: deploy_docs
+  rules: [*is_release_tag]
+  extends: .job_upload_zenodo
 
 
 ##################
@@ -66,6 +91,10 @@ pages:
 .apk_add_yq: &apk_add_yq
   - apk add wget
   - wget --quiet "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64" --output-document=/usr/local/bin/yq && chmod +x /usr/local/bin/yq
+
+.apk_add_zenodraft: &apk_add_zenodraft
+  - apk add npm
+  - npm install --global zenodraft
 
 # Git operation scripts
 .git_commit_all_changes: &git_commit_all_changes
@@ -107,6 +136,17 @@ pages:
     fi
   - git push --push-option=ci.skip https://gitlab-ci-token:$PUSH_TOKEN@$CI_SERVER_HOST/$CI_PROJECT_PATH.git "$PUSH_REFSPEC"
 
+# Zenodo configuration
+.configure_zenodo_server: &configure_zenodo_server
+  - |
+    if [ "$ZENODO_USE_SANDBOX" == "true" ]; then
+      ZENODO_SANDBOX_FLAG="--sandbox"
+      echo "Using Zenodo sandbox environment"
+    else
+      ZENODO_SANDBOX_FLAG=""
+      echo "Using Zenodo production environment"
+    fi
+
 
 ##################
 ## JOB TEMPLATES
@@ -118,12 +158,91 @@ default:
 ####################################################################################################
 
 
+.job_prepare_release:
+
+  before_script:
+    - apk add coreutils  # For avoiding "realpath: --: No such file or directory"
+    - *apk_add_git_and_config
+    - apk add uv
+    - *apk_add_yq
+    - *apk_add_zenodraft
+    - *configure_zenodo_server
+
+  script:
+    # Make sure that the source branch is up-to-date with the release tag (otherwise changes could get lost)
+    - git fetch --depth=1 origin "$BRANCH_SOURCE"
+    - |
+      if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/$BRANCH_SOURCE)" ]; then
+        echo "Release tag ($CI_COMMIT_TAG) ist not in sync with branch ($BRANCH_SOURCE)."
+        echo "Please push the branch and let the pipeline finish before creating a release tag."
+        exit 11
+      fi
+
+    # Get current DOI from CITATION.cff
+    - DOI_CURRENT="$(yq eval '.doi' CITATION.cff)"
+    - echo "DOI_CURRENT=$DOI_CURRENT"
+
+    # Get Zenodo collection id
+    - |
+      ZENODO_COLLECTION_ID=$(\
+        DOI="$DOI_CURRENT" \
+        ZENODO_SANDBOX="$ZENODO_USE_SANDBOX" \
+        uv run \
+          --with requests \
+          python .github/scripts/get_zenodo_collection.py \
+        )
+    - echo "ZENODO_COLLECTION_ID=$ZENODO_COLLECTION_ID"
+
+    # Create new Zenodo record
+    - |
+      if [ -n "$ZENODO_COLLECTION_ID" ]; then
+        echo "Creating new version of existing collection..."
+        ZENODO_VERSION_ID=$(zenodraft deposition create version $ZENODO_COLLECTION_ID $ZENODO_SANDBOX_FLAG) \
+          || ( echo "ERROR: Failed to create new version. Possible causes:" \
+                    "- An open draft already exists for this collection on Zenodo" \
+                    "- Network connectivity issues" \
+                    "- Invalid access token" \
+                    "Please check Zenodo dashboard and try again." \
+              && exit 12 )
+      else
+        # If this is the first release, create a new Zenodo record collection/concept
+        echo "Creating new collection (first release)..."
+        ZENODO_VERSION_ID=$(zenodraft deposition create concept $ZENODO_SANDBOX_FLAG)
+      fi
+    - echo "ZENODO_VERSION_ID=$ZENODO_VERSION_ID"
+
+    # Get prereserved DOI
+    - DOI_PRERESERVED=$(zenodraft deposition show prereserved $ZENODO_SANDBOX_FLAG $ZENODO_VERSION_ID)
+    - echo "DOI_PRERESERVED=$DOI_PRERESERVED"
+
+    # Update DOI in CITATION.cff
+    - yq eval --inplace ".doi = \"$DOI_PRERESERVED\"" CITATION.cff
+
+    # Get current date
+    - CURRENT_DATE=$(date '+%Y-%m-%d')
+    # Update date-released in CITATION.cff
+    - yq eval --inplace ".date-released=\"${CURRENT_DATE}\"" CITATION.cff
+    # Update version in CITATION.cff
+    - yq eval --inplace ".version=\"${CI_COMMIT_TAG}\"" CITATION.cff
+
+    # Commit changes
+    - COMMIT_MESSAGE="[CI] Update CITATION.cff with prereserved Zenodo DOI"
+    - COMMIT_BRANCH="${BRANCH_SOURCE}"
+    - *git_commit_all_changes
+    # Push changes
+    - PUSH_REFSPEC="$COMMIT_BRANCH"
+    - *git_push
+
+####################################################################################################
+
+
 .job_synchronize_metadata:
 
   before_script:
     - apk add coreutils  # For avoiding "realpath: --: No such file or directory"
     - *apk_add_git_and_config
     - apk add jq
+    - apk add sed
     - apk add uv
     - *apk_add_yq
     - SWITCH_BRANCH="$BRANCH_SOURCE"
@@ -194,6 +313,19 @@ default:
         --gl-repository-url ${CI_PROJECT_URL} \
         --default-branch ${BRANCH_SOURCE}
 
+    ## DOI synchronisation
+
+    # Get DOI from CITATION.cff
+    - DOI_PRERESERVED=$(yq eval '.doi' CITATION.cff)
+
+    # Update DOI in index.md
+    - DOI_OLD=$(grep 'urlToResource:' resources/index.md | grep -o -E '[0-9]+\.[0-9]+/.*\.[0-9]+')
+    - echo "DOI_OLD=$DOI_OLD"
+    - sed -i --follow-symlinks "s@$DOI_OLD@$DOI_PRERESERVED@g" resources/index.md
+
+    # Update DOI in PowerPoint files
+    - uv run --with pyyaml,python-pptx python .github/scripts/update_doi_pptx.py
+
     # Commit changes
     - COMMIT_MESSAGE="[CI] Update metadata"
     - COMMIT_BRANCH="${BRANCH_SOURCE}"
@@ -256,3 +388,28 @@ default:
   artifacts:
     paths:
       - public/
+
+####################################################################################################
+
+
+.job_upload_zenodo:
+
+  before_script:
+    - *apk_add_git_and_config
+    - *apk_add_zenodraft
+    - SWITCH_BRANCH="$BRANCH_SOURCE"
+    - *git_reset_hard_branch
+    - *configure_zenodo_server
+
+  script:
+    # Extract ZENODO_VERSION_ID from CITATION.cff (number after last .)
+    - "ZENODO_VERSION_ID=$(sed -n -e 's/^doi: .*\\.//p' CITATION.cff)"
+    - echo "ZENODO_VERSION_ID=$ZENODO_VERSION_ID"
+
+    # Upload the metadata from .zenodo.json
+    - zenodraft metadata update $ZENODO_SANDBOX_FLAG $ZENODO_VERSION_ID .zenodo.json
+
+    # Upload contents to Zenodo
+    - ZIP_FILENAME_SOURCE="${CI_PROJECT_NAME}__$(git rev-parse --short HEAD).zip"
+    - git archive --output="$ZIP_FILENAME_SOURCE" "$BRANCH_SOURCE"
+    - zenodraft file add $ZENODO_SANDBOX_FLAG $ZENODO_VERSION_ID "$ZIP_FILENAME_SOURCE"
